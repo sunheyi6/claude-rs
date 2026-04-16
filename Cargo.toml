@@ -1,0 +1,41 @@
+[workspace]
+members = [
+    "crates/claude-rs-cli",
+    "crates/claude-rs-core",
+    "crates/claude-rs-llm",
+    "crates/claude-rs-tools",
+    "crates/claude-rs-sandbox",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["claude-rs contributors"]
+license = "MIT"
+repository = "https://github.com/yourname/claude-rs"
+
+[workspace.dependencies]
+tokio = { version = "1.44", features = ["full"] }
+tokio-stream = "0.1"
+tempfile = "3.15"
+chrono = { version = "0.4", features = ["serde"] }
+whoami = "1.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
+futures = "0.3"
+async-trait = "0.1"
+clap = { version = "4.5", features = ["derive", "env"] }
+ratatui = "0.29"
+crossterm = "0.28"
+toml = "0.8"
+dirs = "6.0"
+similar = "2.7"
+globset = "0.4"
+ignore = "0.4"
+pulldown-cmark = "0.13"

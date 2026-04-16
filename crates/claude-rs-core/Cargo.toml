@@ -1,0 +1,19 @@
+[package]
+name = "claude-rs-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+claude-rs-llm = { path = "../claude-rs-llm" }
+claude-rs-tools = { path = "../claude-rs-tools" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tempfile = { workspace = true }
+dirs = { workspace = true }
+chrono = { workspace = true }
