@@ -70,3 +70,59 @@ impl Tool for ReadTool {
         Ok(result.trim_end().to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::fs;
+
+    fn temp_file(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        std::env::temp_dir().join(format!("claude_rs_read_test_{name}_{stamp}.txt"))
+    }
+
+    #[tokio::test]
+    async fn test_read_execute_normal_reads_selected_lines() {
+        let path = temp_file("normal");
+        fs::write(&path, "a\nb\nc\nd\n").await.expect("write fixture");
+        let tool = ReadTool;
+
+        let output = tool
+            .execute(json!({"path": path.to_string_lossy(), "offset": 2, "limit": 2}))
+            .await
+            .expect("read should succeed");
+
+        assert!(output.contains("2 | b"));
+        assert!(output.contains("3 | c"));
+        assert!(!output.contains("1 | a"));
+        fs::remove_file(path).await.expect("cleanup fixture");
+    }
+
+    #[tokio::test]
+    async fn test_read_execute_boundary_offset_out_of_range() {
+        let path = temp_file("boundary");
+        fs::write(&path, "only\n").await.expect("write fixture");
+        let tool = ReadTool;
+
+        let output = tool
+            .execute(json!({"path": path.to_string_lossy(), "offset": 99}))
+            .await
+            .expect("read should return message");
+
+        assert!(output.contains("out of range"));
+        fs::remove_file(path).await.expect("cleanup fixture");
+    }
+
+    #[tokio::test]
+    async fn test_read_execute_error_missing_path() {
+        let tool = ReadTool;
+        let err = tool.execute(json!({})).await;
+        assert!(err.is_err());
+    }
+}

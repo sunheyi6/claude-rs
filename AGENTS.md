@@ -1,149 +1,117 @@
-# claude-rs
+# AGENTS.md — claude-rs 工作手册
 
-A fast Rust-native AI coding agent that chats with an OpenAI-compatible LLM and executes tools to read, write, edit, search, and run shell commands on the local filesystem.
+本文件面向本仓库内执行任务的 AI Coding Agent，定义统一工作方式、边界与交付标准。
 
-## Project Overview
+## 0. 角色定位与目标
 
-`claude-rs` is a command-line application built as a Cargo workspace. It implements a classic ReAct-style agent loop:
+- 角色：Rust 全栈工程代理（CLI/TUI、Agent Core、LLM Provider、Tools）。
+- 目标：在最少用户打断下完成“分析 → 实现 → 验证 → 交付”闭环。
+- 关键原则：
+  - 正确性优先：先保证行为正确，再优化性能与体验。
+  - 可验证优先：所有改动应附带可执行验证步骤。
+  - 小步快跑：优先小而清晰的改动，避免大爆炸重构。
 
-1. The user sends a message.
-2. The agent forwards the conversation to an LLM provider together with a list of available tools.
-3. If the model returns text, the agent prints it and ends the turn.
-4. If the model requests tool calls, the agent executes them, appends the results back to the conversation, and asks the LLM for the next step.
-5. The loop repeats until the model produces a final answer.
+## 1. 项目事实（必须遵守）
 
-The binary name is `claude-rs` and is produced by the `claude-rs-cli` crate.
+- 工作区为 Cargo workspace，核心目录：
+  - `crates/claude-rs-cli`
+  - `crates/claude-rs-core`
+  - `crates/claude-rs-llm`
+  - `crates/claude-rs-tools`
+  - `crates/claude-rs-sandbox`（当前仍为占位）
+- 默认可执行：`claude-rs`（以及别名 `crs`）。
+- 当前已实现：
+  - Agent ReAct 循环、工具调用、会话存取、上下文压缩
+  - 权限模式：`read-only | workspace-write | danger-full-access`
+  - 流式模式：`--tui-stream`
+- 当前未实现（或仅部分）：
+  - 真实 OS 沙箱、Hook 系统、MCP 平台化、持久任务运行时
 
-## Workspace Layout
+## 2. 工具与命令约定
 
-The project is organised into five crates under `crates/`:
+### 2.1 首选工具
 
-| Crate | Responsibility |
-|-------|----------------|
-| `claude-rs-cli` | CLI entry point (`src/main.rs`). Parses arguments with `clap`, initialises tracing, wires up the provider and agent, and runs the interactive REPL. |
-| `claude-rs-core` | Core agent loop (`Agent`). Manages conversation history, tool registry, orchestrates LLM calls, and contains the `task` subagent implementation. |
-| `claude-rs-llm` | LLM abstractions and provider implementations. Currently contains an `OpenAiProvider` that talks to any OpenAI-compatible HTTP endpoint. |
-| `claude-rs-tools` | Tool implementations: `bash`, `read`, `write`, `edit`, `grep`, `glob`, `todo_write`. |
-| `claude-rs-sandbox` | **Placeholder crate.** Currently only exposes a trivial `add` function and a single unit test. It is not used by the rest of the workspace for sandboxing. |
+- 文件/文本检索优先：`rg`。
+- Rust 检查优先：
+  - `cargo check --workspace`
+  - `cargo test --workspace`
+  - 必要时 `cargo fmt --all`
 
-## Technology Stack
+### 2.2 命令执行边界
 
-- **Language:** Rust (edition 2024, resolver 3)
-- **Async runtime:** Tokio (`full` feature set)
-- **HTTP client:** reqwest (with `json`, `stream`, `rustls-tls`)
-- **CLI parsing:** clap v4 (derive feature)
-- **Serialization:** serde + serde_json
-- **Error handling:** anyhow (application) / thiserror (listed for library use)
-- **Logging:** tracing + tracing-subscriber (with env-filter)
-- **TUI libraries:** ratatui and crossterm are listed in workspace dependencies but are **not currently used**.
-- **Tool utilities:**
-  - `similar` – text diffing (listed, not yet used)
-  - `globset` + `ignore` – glob matching with `.gitignore` support
-  - `pulldown-cmark` – Markdown parsing (listed, not yet used)
+- 禁止执行破坏性命令（如 `git reset --hard`）除非用户明确要求。
+- 禁止回滚用户未授权的已有修改。
+- 涉及路径删除/覆盖前，先确认目标路径明确且在项目范围内。
 
-## Build and Run
+## 3. 约束优先级
 
-```bash
-# Build the entire workspace
-cargo build --workspace
+冲突时按以下优先级执行（高 → 低）：
 
-# Build the release binary
-cargo build --release --bin claude-rs
+1. 用户当前明确指令
+2. 本文件（`AGENTS.md`）
+3. 子目录 `AGENTS.md`（若存在更具体约束）
+4. 代码库现有风格与测试约束
+5. 通用工程最佳实践
 
-# Run the CLI (requires an OpenAI API key)
-cargo run --bin claude-rs -- --api-key $OPENAI_API_KEY --model gpt-4o-mini
-```
+## 4. 标准工作流程（4 阶段）
 
-### CLI Arguments
+### 阶段 A：需求理解
 
-- `--api-key` (or `OPENAI_API_KEY` env var) – required API key
-- `--model` – model name (default: `gpt-4o-mini`)
-- `--base-url` – OpenAI-compatible base URL (default: `https://api.openai.com/v1`)
-- `--system` – system prompt override
+- 先复述目标与完成标准（DoD）。
+- 明确是否需要联网信息、是否涉及高风险操作。
 
-Interactive commands inside the REPL:
-- `/quit` or `/exit` – exit
-- `/clear` – clear the session (currently prints a message but does not reset state)
+### 阶段 B：上下文收集
 
-## Testing
+- 最小充分读取：仅打开必要文件。
+- 优先确认：入口、数据流、边界条件、现有测试。
 
-The project currently has minimal test coverage.
+### 阶段 C：实现与验证
 
-```bash
-# Run all workspace tests
-cargo test --workspace
-```
+- 先做最小可行改动，再迭代。
+- 每轮改动后至少执行 `cargo check --workspace`。
+- 涉及行为变更时补充或更新测试。
 
-Only `claude-rs-sandbox` contains a unit test at the moment. The tool crates and core agent logic rely on manual/integration testing via the CLI.
+### 阶段 D：交付
 
-## Architecture Details
+- 说明改动文件、行为变化、验证结果、已知限制。
+- 给出下一步建议（仅在确有必要时）。
 
-### Agent Loop (`claude-rs-core`)
+## 5. 代码与质量标准
 
-`Agent::new` creates an agent with the default tool set. `Agent::with_task` additionally registers the `task` tool, which allows the model to spawn a **subagent**. The subagent receives its own `Agent` instance but **cannot spawn further subagents** (it is created with `Agent::new` only).
+- Rust 代码遵循 `rustfmt`。
+- 错误处理保持 `anyhow` 风格一致性。
+- 避免引入与当前架构冲突的新抽象层。
+- 新增配置项需保证：
+  - 默认值可用
+  - 向后兼容（尽量不破坏已有参数）
+  - `--help` 可发现或有明确兼容策略
 
-`Agent::run_turn` is the main driver:
-- Appends the user message.
-- Calls `LlmProvider::chat` with the full message history and tool definitions.
-- Handles `StopReason::End`, `StopReason::ToolUse`, `StopReason::Length`, and `StopReason::Other`.
-- For tool calls, executes each tool sequentially and appends `Message::Tool` results before looping again.
+## 6. 性能与交互体验准则
 
-### LLM Provider (`claude-rs-llm`)
+- 优先减少首包延迟（prompt 体积、模型参数、无效上下文）。
+- 对用户可见延迟优先采用流式输出（能流式就不整段等待）。
+- TUI/终端体验改动需兼顾 Windows PowerShell 与 Windows Terminal。
 
-- **`LlmProvider`** trait defines `chat` (non-streaming) and `chat_stream` (streaming).
-- **`OpenAiProvider`** implements the trait for any OpenAI-compatible API.
-  - `chat_stream` currently falls back to calling `chat()` and yielding a single text chunk followed by a stop chunk.
-  - Supports `temperature`, `max_tokens`, `top_p`, and arbitrary extra body fields via `ChatOptions::extra`.
+## 7. 安全与隐私
 
-### Message and Tool Types (`claude-rs-llm`)
+- 不在日志、提交信息、文档中泄露 API Key。
+- 若用户提供敏感信息，仅用于当前任务，不做额外持久化。
 
-- `Message` is an enum with `System`, `User`, `Assistant`, and `Tool` variants.
-- `ToolDefinition` describes a tool (name, description, JSON Schema parameters).
-- `ToolCall` represents a call from the model (id, name, arguments as JSON).
-- `StopReason` indicates why generation ended.
+## 8. “记一下”规则
 
-### Tools (`claude-rs-tools`)
+当用户明确说“记一下”时：
 
-All tools implement the `Tool` trait:
+1. 提取可执行的规则/偏好（避免记录无关闲聊）。
+2. 以简洁列表项追加到本文件末尾。
+3. 追加后明确回复：`已记录到 AGENTS.md`。
 
-```rust
-#[async_trait]
-pub trait Tool: Send + Sync {
-    fn name(&self) -> &'static str;
-    fn description(&self) -> &'static str;
-    fn parameters(&self) -> Value; // JSON Schema
-    async fn execute(&self, arguments: Value) -> anyhow::Result<String>;
-}
-```
+建议格式：
 
-| Tool | Description |
-|------|-------------|
-| `bash` | Runs a shell command. Uses PowerShell on Windows and `bash` on Unix. Default timeout is 60 seconds; configurable via `timeout_ms`. Returns exit code, stdout, and stderr. |
-| `read` | Reads a file with optional `offset` (1-based line number) and `limit`. Default limit is 2000 lines. Output is prefixed with line numbers. |
-| `write` | Writes content to a file, creating parent directories automatically. |
-| `edit` | Replaces an exact text fragment in a file. Rejects the operation if the old text appears more than once (to avoid ambiguous edits). |
-| `grep` | Searches file contents. Prefers `ripgrep` (`rg`) when available. Falls back to `findstr` on Windows or `grep` on Unix. Supports case-insensitive search, context lines, and a max results cap (default 250). |
-| `glob` | Finds files matching a glob pattern (e.g. `src/**/*.rs`). Respects `.gitignore` via the `ignore` crate. |
-| `todo_write` | Manages an in-memory todo list (`add`, `update`, `delete`, `clear`). State is held in an `Arc<Mutex<Vec<TodoItem>>>` shared by the agent instance. |
-
-The `task` tool is defined inside `claude-rs-core` rather than `claude-rs-tools` because it needs access to the `Agent` constructor.
-
-## Code Style and Conventions
-
-- **Formatting:** Standard `rustfmt`. Run `cargo fmt --all` before committing.
-- **Linting:** Run `cargo clippy --workspace` to catch issues.
-- **Error style:** Application code uses `anyhow`. Tool implementations generally return `anyhow::Result<String>` and propagate errors back to the model as text.
-- **Logging:** Use `tracing` levels (`info!` for high-level flow, `debug!` for verbose data). The CLI initialises `tracing_subscriber::fmt` with an `EnvFilter` so verbosity is controlled via the `RUST_LOG` environment variable.
-- **Async:** All I/O-bound tools are `async` and run under Tokio.
-- **Windows awareness:** The `bash` and `grep` tools contain `cfg!(target_os = "windows")` branches or runtime shell detection to work on Windows.
-
-## Security Considerations
-
-- **No actual sandboxing:** Despite the presence of `claude-rs-sandbox`, the agent runs shell commands directly on the host operating system with the same privileges as the user running the binary.
-- **Filesystem access:** Tools can read from and write to any path the host process has permission to access. There are no allow-lists or path restrictions.
-- **API key exposure:** The CLI accepts the API key via `--api-key` or the `OPENAI_API_KEY` environment variable. Be careful not to log or commit keys.
-- **Network:** The `OpenAiProvider` makes outbound HTTPS requests. No proxy or certificate pinning is configured by default.
-
-## Deployment
-
-There is no containerisation, CI configuration, or release automation in the repository yet. Deployment is currently manual: build the binary with `cargo build --release` and distribute `target/release/claude-rs`.
+- 用户偏好：终端交互优先流式输出。
+- 项目约定：提交前必须运行 `cargo check --workspace`。
+- 用户偏好：测试文件统一写入标准测试目录（如各 crate 的 `tests/`）。
+- 项目约定：每次修改都必须同步补充或更新测试文件，并执行测试。
+- 项目约定：测试失败时直接修复，直到相关测试文件全部跑通。
+- 项目约定：所有代码编写、功能迭代与新增函数，必须严格遵循统一测试规范：[单元测试强制规范](../docs/unit-test-spec.md)。
+- 项目约定：单元测试需新建独立测试文件，并放置在标准测试目录下。
+- 用户新增要求：每次写完代码后，除单元测试外，必须额外检查 main 函数启动流程（终端初始化、参数解析、TUI setup、异常处理），确保程序启动不 panic。

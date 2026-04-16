@@ -30,3 +30,54 @@ pub trait Tool: Send + Sync {
 pub fn definition(tool: &dyn Tool) -> ToolDefinition {
     ToolDefinition::new(tool.name(), tool.description(), tool.parameters())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    struct MockTool;
+
+    #[async_trait]
+    impl Tool for MockTool {
+        fn name(&self) -> &'static str {
+            "mock_tool"
+        }
+
+        fn description(&self) -> &'static str {
+            "mock desc"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({"type":"object"})
+        }
+
+        async fn execute(&self, _arguments: Value) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+    }
+
+    #[test]
+    fn test_definition_normal_builds_tool_definition() {
+        let tool = MockTool;
+        let def = definition(&tool);
+        assert_eq!(def.name, "mock_tool");
+        assert_eq!(def.description, "mock desc");
+        assert_eq!(def.parameters["type"], "object");
+    }
+
+    #[test]
+    fn test_definition_boundary_non_empty_name_and_description() {
+        let tool = MockTool;
+        let def = definition(&tool);
+        assert!(!def.name.is_empty());
+        assert!(!def.description.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_definition_error_path_not_applicable_execute_still_returns_ok() {
+        let tool = MockTool;
+        let result = tool.execute(json!({})).await;
+        assert!(result.is_ok());
+    }
+}

@@ -243,6 +243,7 @@ dependencies = [
  "dirs",
  "ratatui",
  "serde",
+ "serde_json",
  "tokio",
  "toml",
  "tracing",
@@ -264,6 +265,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tracing",
 ]
 

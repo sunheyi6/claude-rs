@@ -59,3 +59,64 @@ impl Tool for GlobTool {
         Ok(files.join("\n"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::fs;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        std::env::temp_dir().join(format!("claude_rs_glob_test_{name}_{stamp}"))
+    }
+
+    #[tokio::test]
+    async fn test_glob_execute_normal_matches_expected_files() {
+        let dir = temp_dir("normal");
+        fs::create_dir_all(dir.join("src")).await.expect("create dir");
+        fs::write(dir.join("src/a.rs"), "fn a() {}")
+            .await
+            .expect("write file");
+        fs::write(dir.join("src/b.txt"), "x")
+            .await
+            .expect("write file");
+        let tool = GlobTool;
+
+        let output = tool
+            .execute(json!({"pattern":"src/**/*.rs","path": dir.to_string_lossy()}))
+            .await
+            .expect("glob should succeed");
+
+        assert!(output.contains("a.rs"));
+        assert!(!output.contains("b.txt"));
+        fs::remove_dir_all(dir).await.expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn test_glob_execute_boundary_no_matches_returns_empty_string() {
+        let dir = temp_dir("boundary");
+        fs::create_dir_all(&dir).await.expect("create dir");
+        let tool = GlobTool;
+
+        let output = tool
+            .execute(json!({"pattern":"**/*.md","path": dir.to_string_lossy()}))
+            .await
+            .expect("glob should succeed");
+
+        assert_eq!(output, "");
+        fs::remove_dir_all(dir).await.expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn test_glob_execute_error_invalid_pattern() {
+        let tool = GlobTool;
+        let err = tool.execute(json!({"pattern":"["})).await;
+        assert!(err.is_err());
+    }
+}

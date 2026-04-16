@@ -121,3 +121,63 @@ impl Tool for GrepTool {
         Ok(result)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::fs;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        std::env::temp_dir().join(format!("claude_rs_grep_test_{name}_{stamp}"))
+    }
+
+    #[tokio::test]
+    async fn test_grep_execute_normal_finds_match() {
+        let dir = temp_dir("normal");
+        fs::create_dir_all(&dir).await.expect("create dir");
+        let file = dir.join("main.txt");
+        fs::write(&file, "alpha\nneedle\nomega")
+            .await
+            .expect("write fixture");
+        let tool = GrepTool;
+
+        let output = tool
+            .execute(json!({"pattern":"needle","path": file.to_string_lossy()}))
+            .await
+            .expect("grep should succeed");
+
+        assert!(output.contains("needle"));
+        fs::remove_dir_all(dir).await.expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn test_grep_execute_boundary_no_match() {
+        let dir = temp_dir("boundary");
+        fs::create_dir_all(&dir).await.expect("create dir");
+        let file = dir.join("main.txt");
+        fs::write(&file, "alpha\nbeta").await.expect("write fixture");
+        let tool = GrepTool;
+
+        let output = tool
+            .execute(json!({"pattern":"missing","path": file.to_string_lossy()}))
+            .await
+            .expect("grep should return no-match message");
+
+        assert_eq!(output, "No matches found.");
+        fs::remove_dir_all(dir).await.expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn test_grep_execute_error_missing_pattern() {
+        let tool = GrepTool;
+        let err = tool.execute(json!({"path":"."})).await;
+        assert!(err.is_err());
+    }
+}

@@ -72,3 +72,79 @@ impl Tool for EditTool {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::fs;
+
+    fn temp_file(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        std::env::temp_dir().join(format!("claude_rs_edit_test_{name}_{stamp}.txt"))
+    }
+
+    #[tokio::test]
+    async fn test_edit_execute_normal_single_replacement() {
+        let path = temp_file("normal");
+        fs::write(&path, "alpha beta gamma")
+            .await
+            .expect("write fixture");
+        let tool = EditTool;
+
+        let output = tool
+            .execute(json!({
+                "path": path.to_string_lossy(),
+                "old_text": "beta",
+                "new_text": "delta"
+            }))
+            .await
+            .expect("edit should succeed");
+
+        assert!(output.contains("Successfully edited"));
+        let after = fs::read_to_string(&path).await.expect("read edited content");
+        assert_eq!(after, "alpha delta gamma");
+        fs::remove_file(path).await.expect("cleanup fixture");
+    }
+
+    #[tokio::test]
+    async fn test_edit_execute_boundary_multiple_occurrences_rejected() {
+        let path = temp_file("boundary");
+        fs::write(&path, "same same").await.expect("write fixture");
+        let tool = EditTool;
+
+        let err = tool
+            .execute(json!({
+                "path": path.to_string_lossy(),
+                "old_text": "same",
+                "new_text": "x"
+            }))
+            .await;
+
+        assert!(err.is_err());
+        fs::remove_file(path).await.expect("cleanup fixture");
+    }
+
+    #[tokio::test]
+    async fn test_edit_execute_error_old_text_missing() {
+        let path = temp_file("error");
+        fs::write(&path, "hello world").await.expect("write fixture");
+        let tool = EditTool;
+
+        let err = tool
+            .execute(json!({
+                "path": path.to_string_lossy(),
+                "old_text": "missing",
+                "new_text": "x"
+            }))
+            .await;
+
+        assert!(err.is_err());
+        fs::remove_file(path).await.expect("cleanup fixture");
+    }
+}

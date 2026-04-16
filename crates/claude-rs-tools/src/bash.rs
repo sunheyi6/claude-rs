@@ -83,3 +83,42 @@ impl Tool for BashTool {
         Ok(result.trim_end().to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn test_bash_execute_normal_returns_stdout() {
+        let tool = BashTool::default();
+        let output = tool
+            .execute(json!({"command":"Write-Output hello"}))
+            .await
+            .expect("command should run");
+        assert!(output.contains("exit code: 0"));
+        assert!(output.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn test_bash_execute_boundary_empty_stdout() {
+        let tool = BashTool::default();
+        let output = tool
+            .execute(json!({"command":"$null"}))
+            .await
+            .expect("command should run");
+        assert!(output.contains("exit code: 0"));
+    }
+
+    #[tokio::test]
+    async fn test_bash_execute_error_timeout() {
+        let tool = BashTool {
+            timeout: Duration::from_millis(10),
+        };
+        let result = tool
+            .execute(json!({"command":"Start-Sleep -Milliseconds 200","timeout_ms":10}))
+            .await;
+        assert!(result.is_err());
+    }
+}

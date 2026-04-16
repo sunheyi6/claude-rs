@@ -3,10 +3,14 @@ use clap::Parser;
 use claude_rs_core::session;
 use claude_rs_core::{Agent, PermissionMode};
 use claude_rs_llm::{ChatOptions, openai::OpenAiProvider};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::terminal;
 use serde::Deserialize;
+use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{error, info};
 
 mod tui;
@@ -30,7 +34,16 @@ struct Args {
     system: String,
 
     #[arg(long)]
+    tui: bool,
+
+    #[arg(long)]
+    tui_stream: bool,
+
+    #[arg(long, hide = true)]
     no_tui: bool,
+
+    #[arg(long)]
+    no_alt_screen: bool,
 
     #[arg(long)]
     ask: bool,
@@ -43,6 +56,9 @@ struct Args {
 
     #[arg(long, default_value = "workspace-write")]
     permissions: String,
+
+    #[arg(long)]
+    fast: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -50,15 +66,38 @@ struct CliConfig {
     api_key: Option<String>,
 }
 
-fn load_api_key_from_config() -> Option<String> {
-    let home = dirs::home_dir()?;
+fn load_cli_config() -> CliConfig {
+    let home = match dirs::home_dir() {
+        Some(v) => v,
+        None => return CliConfig::default(),
+    };
     let path = home.join(".claude-rs").join("config.toml");
-    let text = std::fs::read_to_string(path).ok()?;
-    let cfg: CliConfig = toml::from_str(&text).ok()?;
-    cfg.api_key.and_then(|k| {
+    let text = match std::fs::read_to_string(path) {
+        Ok(v) => v,
+        Err(_) => return CliConfig::default(),
+    };
+    toml::from_str(&text).unwrap_or_default()
+}
+
+fn normalize_api_key(value: Option<String>) -> Option<String> {
+    value.and_then(|k| {
         let key = k.trim().to_string();
         if key.is_empty() { None } else { Some(key) }
     })
+}
+
+fn apply_speed_profile(options: &mut ChatOptions, fast: bool) {
+    if fast {
+        // Lower output length for faster completion time.
+        options.max_tokens = Some(1024);
+        // Kimi thinking models support disabling thinking for lower latency.
+        options.extra.insert(
+            "thinking".to_string(),
+            serde_json::json!({
+                "type": "disabled"
+            }),
+        );
+    }
 }
 
 #[tokio::main]
@@ -68,7 +107,12 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let resolved_api_key = args.api_key.clone().or_else(load_api_key_from_config);
+    let cli_cfg = load_cli_config();
+    let test_mode = std::env::var("CLAUDE_RS_TEST_MODE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let resolved_api_key = normalize_api_key(args.api_key.clone())
+        .or_else(|| normalize_api_key(cli_cfg.api_key.clone()));
     let permission_mode = PermissionMode::parse(&args.permissions).ok_or_else(|| {
         anyhow::anyhow!(
             "无效 permissions 模式：{}，可选 read-only / workspace-write / danger-full-access",
@@ -77,7 +121,10 @@ async fn main() -> Result<()> {
     })?;
     info!("启动 claude-rs，模型：{}", args.model);
 
-    if !args.no_tui {
+    let use_tui = args.tui && !args.no_tui;
+    let use_stream_tui = args.tui_stream && !args.no_tui;
+
+    if use_tui {
         let mode = if args.plan {
             tui::Mode::Plan
         } else if args.ask {
@@ -92,7 +139,6 @@ async fn main() -> Result<()> {
             system: args.system,
             mode,
             resume: args.resume,
-            permission_mode,
         })
         .await;
     }
@@ -116,7 +162,8 @@ async fn main() -> Result<()> {
     let provider: Arc<dyn claude_rs_llm::LlmProvider> =
         Arc::new(OpenAiProvider::new(api_key).with_base_url(args.base_url));
 
-    let options = ChatOptions::new(args.model);
+    let mut options = ChatOptions::new(args.model.clone());
+    apply_speed_profile(&mut options, args.fast);
     let mut agent = Agent::new(provider, options).with_task();
     agent.set_system_prompt(args.system);
     agent.set_permission_mode(permission_mode);
@@ -133,21 +180,66 @@ async fn main() -> Result<()> {
         }
     }
 
-    println!("claude-rs 已就绪。请在下方输入消息，输入 /quit 退出。\n");
+    if use_stream_tui {
+        print_stream_tui_welcome(&args.model);
+        if args.no_alt_screen {
+            println!("Tip: 当前 TUI 为流式模式，默认使用 PowerShell 原生滚动条。\n");
+        }
+        if args.fast {
+            println!("Fast mode: ON（低延迟配置已启用）\n");
+        }
+    } else {
+        print_cli_welcome();
+        if args.fast {
+            println!("Fast mode: ON（低延迟配置已启用）\n");
+        }
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    std::thread::spawn(move || loop {
+        match read_input_line_with_fallback() {
+            Ok(Some(v)) => {
+                if tx.send(v).is_err() {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    });
+
+    let mut queued: VecDeque<String> = VecDeque::new();
 
     loop {
-        print!("> ");
-        io::stdout().flush()?;
+        let next = if let Some(v) = queued.pop_front() {
+            v
+        } else {
+            if use_stream_tui {
+                print!("✨ ");
+            } else {
+                print!("> ");
+            }
+            io::stdout().flush()?;
 
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        let input = input.trim();
+            match rx.recv().await {
+                Some(v) => v,
+                None => {
+                    println!("\n输入流已关闭，结束会话。");
+                    break;
+                }
+            }
+        };
 
+        let input = next.trim().to_string();
         if input.is_empty() {
             continue;
         }
 
-        match input {
+        let is_command = input.starts_with('/');
+        if !use_stream_tui && !is_command {
+            print_user_bar(&input);
+        }
+
+        match input.as_str() {
             "/quit" | "/exit" => {
                 println!("再见！");
                 break;
@@ -173,30 +265,6 @@ async fn main() -> Result<()> {
                 }
                 continue;
             }
-            cmd if cmd.starts_with("/permissions ") => {
-                let value = cmd.strip_prefix("/permissions ").unwrap_or("").trim();
-                match PermissionMode::parse(value) {
-                    Some(m) => {
-                        agent.set_permission_mode(m);
-                        println!("权限模式已更新为：{}", m);
-                    }
-                    None => eprintln!(
-                        "无效模式：{}，可选 read-only / workspace-write / danger-full-access",
-                        value
-                    ),
-                }
-                continue;
-            }
-            cmd if cmd.starts_with("/model ") => {
-                let model = cmd.strip_prefix("/model ").unwrap_or("").trim();
-                if model.is_empty() {
-                    eprintln!("用法：/model <模型名>");
-                } else {
-                    agent.set_model(model.to_string());
-                    println!("模型已切换为：{}", agent.model());
-                }
-                continue;
-            }
             "/history" => {
                 match session::list_sessions().await {
                     Ok(sessions) => {
@@ -204,12 +272,7 @@ async fn main() -> Result<()> {
                             println!("没有保存的会话。");
                         } else {
                             for s in sessions {
-                                println!(
-                                    "{} - {} messages - {}",
-                                    s.id,
-                                    s.messages.len(),
-                                    s.updated_at
-                                );
+                                println!("{} - {} messages - {}", s.id, s.messages.len(), s.updated_at);
                             }
                         }
                     }
@@ -217,32 +280,366 @@ async fn main() -> Result<()> {
                 }
                 continue;
             }
-            cmd if cmd.starts_with("/resume ") => {
-                let id = cmd.strip_prefix("/resume ").unwrap_or("").trim();
-                if id.is_empty() {
-                    eprintln!("用法：/resume <会话ID>");
-                    continue;
+            _ => {}
+        }
+
+        if let Some(value) = input.strip_prefix("/permissions ") {
+            let value = value.trim();
+            match PermissionMode::parse(value) {
+                Some(m) => {
+                    agent.set_permission_mode(m);
+                    println!("权限模式已更新为：{}", m);
                 }
+                None => eprintln!("无效模式：{}，可选 read-only / workspace-write / danger-full-access", value),
+            }
+            continue;
+        }
+        if let Some(model) = input.strip_prefix("/model ") {
+            let model = model.trim();
+            if model.is_empty() {
+                eprintln!("用法：/model <模型名>");
+            } else {
+                agent.set_model(model.to_string());
+                println!("模型已切换为：{}", agent.model());
+            }
+            continue;
+        }
+        if let Some(value) = input.strip_prefix("/fast ") {
+            let enabled = matches!(value.trim().to_ascii_lowercase().as_str(), "on" | "1" | "true");
+            agent.set_fast_mode(enabled);
+            if enabled {
+                println!("Fast mode 已开启（max_tokens=1024, thinking=disabled）。");
+            } else {
+                println!("Fast mode 已关闭。");
+            }
+            continue;
+        }
+        if let Some(id) = input.strip_prefix("/resume ") {
+            let id = id.trim();
+            if id.is_empty() {
+                eprintln!("用法：/resume <会话ID>");
+            } else {
                 match agent.load_session(id).await {
                     Ok(()) => println!("已恢复会话 {}。", id),
                     Err(e) => eprintln!("恢复会话失败：{}", e),
                 }
-                continue;
             }
-            _ => {}
+            continue;
         }
 
-        match agent.run_turn(input).await {
-            Ok(reply) => {
-                println!("\n{}", reply);
+        if test_mode {
+            if input.starts_with('/') {
+                println!("错误：未知命令（test mode）");
+            } else {
+                println!("\n• TEST_ECHO: {}", input);
             }
-            Err(e) => {
-                error!("代理错误：{}", e);
-                eprintln!("错误：{}", e);
+            println!();
+            continue;
+        }
+
+        print!("\n");
+        io::stdout().flush()?;
+        let mut run_fut = Box::pin(agent.run_turn_stream(input.clone(), |chunk| {
+            print!("{}", chunk);
+            let _ = io::stdout().flush();
+        }));
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = tokio::signal::ctrl_c() => {
+                    queued.clear();
+                    println!("\n\n已手动中断当前任务，已清空排队命令。");
+                    break;
+                }
+                Some(line) = rx.recv() => {
+                    let line = line.trim().to_string();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    queued.push_back(line.clone());
+                    print_queued_preview(&line, queued.len());
+                }
+                res = &mut run_fut => {
+                    match res {
+                        Ok(_) => {
+                            println!();
+                        }
+                        Err(e) => {
+                            error!("代理错误：{}", e);
+                            eprintln!("\n错误：{}", e);
+                        }
+                    }
+                    break;
+                }
             }
         }
         println!();
     }
 
     Ok(())
+}
+
+fn read_input_line_with_fallback() -> anyhow::Result<Option<String>> {
+    let mut input = String::new();
+    match io::stdin().read_line(&mut input) {
+        Ok(0) => Ok(None),
+        Ok(_) => Ok(Some(input)),
+        Err(e) => {
+            #[cfg(target_os = "windows")]
+            {
+                // In some Windows sessions stdin can be unavailable/pipe-closed.
+                // Always fallback to key-event reading for robust interactive input.
+                let _ = e;
+                let line = read_line_from_key_events()?;
+                return Ok(Some(line));
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                Err(e.into())
+            }
+        }
+    }
+}
+
+fn read_line_from_key_events() -> anyhow::Result<String> {
+    terminal::enable_raw_mode()?;
+    let mut buffer = String::new();
+
+    loop {
+        match event::read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Enter => {
+                    println!();
+                    terminal::disable_raw_mode()?;
+                    return Ok(buffer);
+                }
+                KeyCode::Backspace => {
+                    if buffer.pop().is_some() {
+                        print!("\u{8} \u{8}");
+                        io::stdout().flush()?;
+                    }
+                }
+                KeyCode::Char(c) => {
+                    buffer.push(c);
+                    print!("{c}");
+                    io::stdout().flush()?;
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+}
+
+fn print_cli_welcome() {
+    const ORANGE: &str = "\x1b[38;5;209m";
+    const DIM: &str = "\x1b[90m";
+    const WHITE: &str = "\x1b[97m";
+    const RESET: &str = "\x1b[0m";
+
+    let w = render_width();
+    let inner = w.saturating_sub(2);
+    let left_w = inner * 36 / 100;
+    let right_w = inner.saturating_sub(left_w + 1);
+
+    println!("{ORANGE}─ claude-rs v{} ─{RESET}", env!("CARGO_PKG_VERSION"));
+    println!("{ORANGE}┌{}┐{RESET}", "─".repeat(inner));
+
+    let left = vec![
+        format!("{WHITE}欢迎回来！{RESET}"),
+        String::new(),
+        "    _ _".to_string(),
+        "  _(o o)_".to_string(),
+        " /  \\_/  \\".to_string(),
+        " \\__/ \\__/".to_string(),
+        String::new(),
+        format!(
+            "{DIM}{} · {}{RESET}",
+            whoami::username(),
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .display()
+        ),
+    ];
+    let right = vec![
+        format!("{ORANGE}快速开始{RESET}"),
+        "运行 /init 创建 AGENTS.md 项目指令文件。".to_string(),
+        "使用 /status 查看模型和权限模式。".to_string(),
+        "使用 /permissions <mode> 切换安全级别。".to_string(),
+        "按需使用 /compact、/save、/history。".to_string(),
+        String::new(),
+        format!("{ORANGE}最近活动{RESET}"),
+        format!("{DIM}暂无最近活动{RESET}"),
+    ];
+
+    let rows = left.len().max(right.len()).max(9);
+    for i in 0..rows {
+        let l = left.get(i).cloned().unwrap_or_default();
+        let r = right.get(i).cloned().unwrap_or_default();
+        println!(
+            "{ORANGE}│{RESET}{}{ORANGE}│{RESET}{}{ORANGE}│{RESET}",
+            pad_ansi(&l, left_w),
+            pad_ansi(&r, right_w)
+        );
+    }
+
+    println!("{ORANGE}└{}┘{RESET}", "─".repeat(inner));
+    println!();
+}
+
+fn print_stream_tui_welcome(model: &str) {
+    let cwd = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .display()
+        .to_string();
+    let session = format!(
+        "{:x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    );
+
+    const BLUE: &str = "\x1b[94m";
+    const DIM: &str = "\x1b[90m";
+    const RESET: &str = "\x1b[0m";
+
+    println!("{BLUE}┌──────────────────────────────────────────────────────────────────────────────┐{RESET}");
+    println!("{BLUE}│{RESET}  欢迎使用 claude-rs TUI！                                                   {BLUE}│{RESET}");
+    println!("{BLUE}│{RESET}  可用命令：/status /permissions /model /compact /quit                  {BLUE}│{RESET}");
+    println!("{BLUE}│{RESET}                                                                              {BLUE}│{RESET}");
+    println!("{BLUE}│{RESET}  {DIM}目录：{RESET} {cwd}");
+    println!("{BLUE}│{RESET}  {DIM}会话：{RESET} {session}");
+    println!("{BLUE}│{RESET}  {DIM}模型：{RESET} {model}");
+    println!("{BLUE}└──────────────────────────────────────────────────────────────────────────────┘{RESET}");
+    println!();
+}
+
+fn render_width() -> usize {
+    crossterm::terminal::size()
+        .map(|(w, _)| (w as usize).clamp(80, 160))
+        .unwrap_or(120)
+}
+
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                let _ = chars.next();
+                for ch in chars.by_ref() {
+                    if ch.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn pad_ansi(s: &str, width: usize) -> String {
+    let visible = strip_ansi(s).chars().count();
+    if visible >= width {
+        s.chars().take(width).collect()
+    } else {
+        format!("{s}{}", " ".repeat(width - visible))
+    }
+}
+
+fn print_user_bar(input: &str) {
+    let width = render_width().saturating_sub(2).max(24);
+    let inner = width.saturating_sub(2);
+    let text = input.trim();
+    let shown: String = text.chars().take(inner).collect();
+    let visible = shown.chars().count();
+    let padded = if visible < inner {
+        format!("{shown}{}", " ".repeat(inner - visible))
+    } else {
+        shown
+    };
+
+    const BORDER: &str = "\x1b[38;5;209m";
+    const RESET: &str = "\x1b[0m";
+    println!("{BORDER}│{RESET}{padded}{BORDER}│{RESET}");
+}
+
+fn print_queued_preview(input: &str, queued_len: usize) {
+    let width = render_width().saturating_sub(2).max(24);
+    let inner = width.saturating_sub(2);
+    let text = format!("排队中({queued_len}) {input}");
+    let shown: String = text.chars().take(inner).collect();
+    let visible = shown.chars().count();
+    let padded = if visible < inner {
+        format!("{shown}{}", " ".repeat(inner - visible))
+    } else {
+        shown
+    };
+
+    const BORDER: &str = "\x1b[38;5;209m";
+    const RESET: &str = "\x1b[0m";
+    println!("{BORDER}│{RESET}{padded}{BORDER}│{RESET}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_api_key_normal_trimmed_value() {
+        let value = normalize_api_key(Some("  abc  ".to_string()));
+        assert_eq!(value, Some("abc".to_string()));
+    }
+
+    #[test]
+    fn test_normalize_api_key_boundary_empty_value() {
+        let value = normalize_api_key(Some("   ".to_string()));
+        assert_eq!(value, None);
+    }
+
+    #[test]
+    fn test_apply_speed_profile_normal_sets_fast_fields() {
+        let mut options = ChatOptions::new("model");
+        apply_speed_profile(&mut options, true);
+        assert_eq!(options.max_tokens, Some(1024));
+        assert!(options.extra.contains_key("thinking"));
+    }
+
+    #[test]
+    fn test_apply_speed_profile_boundary_disabled_keeps_defaults() {
+        let mut options = ChatOptions::new("model");
+        apply_speed_profile(&mut options, false);
+        assert_eq!(options.max_tokens, None);
+        assert!(!options.extra.contains_key("thinking"));
+    }
+
+    #[test]
+    fn test_strip_ansi_normal_removes_escape_sequences() {
+        let s = "\u{1b}[31mhello\u{1b}[0m";
+        let out = strip_ansi(s);
+        assert_eq!(out, "hello");
+    }
+
+    #[test]
+    fn test_pad_ansi_boundary_truncates_to_width() {
+        let out = pad_ansi("abcdef", 3);
+        assert_eq!(out, "abc");
+    }
+
+    #[test]
+    fn test_args_parse_error_invalid_permissions_rejected_later() {
+        let parsed = Args::try_parse_from(["claude-rs", "--permissions", "invalid"]);
+        assert!(parsed.is_ok());
+        let mode = PermissionMode::parse("invalid");
+        assert!(mode.is_none());
+    }
+
+    #[test]
+    fn test_print_queued_preview_boundary_empty_text_no_panic() {
+        print_queued_preview("", 0);
+    }
 }

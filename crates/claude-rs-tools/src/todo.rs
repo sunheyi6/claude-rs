@@ -164,3 +164,63 @@ impl Tool for TodoWriteTool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_todo_state_normal_add_and_list() {
+        let state = TodoState::default();
+        state.add("1".to_string(), "task".to_string());
+        let items = state.list();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "1");
+    }
+
+    #[test]
+    fn test_todo_state_boundary_clear_empty() {
+        let state = TodoState::default();
+        state.clear();
+        assert_eq!(state.list().len(), 0);
+    }
+
+    #[test]
+    fn test_todo_state_error_update_missing_item() {
+        let state = TodoState::default();
+        let result = state.update("missing", TodoStatus::Done);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_todo_write_tool_normal_update_and_delete() {
+        let tool = TodoWriteTool {
+            state: TodoState::default(),
+        };
+        tool.execute(json!({"action":"add","todos":[{"id":"1","content":"x"}]}))
+            .await
+            .expect("add should succeed");
+        tool.execute(json!({"action":"update","todos":[{"id":"1","status":"done"}]}))
+            .await
+            .expect("update should succeed");
+        let items = tool.state.list();
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0].status, TodoStatus::Done));
+
+        let msg = tool
+            .execute(json!({"action":"delete","todos":[{"id":"1"}]}))
+            .await
+            .expect("delete should succeed");
+        assert_eq!(msg, "Deleted 1 todo(s)");
+    }
+
+    #[tokio::test]
+    async fn test_todo_write_tool_error_invalid_action() {
+        let tool = TodoWriteTool {
+            state: TodoState::default(),
+        };
+        let result = tool.execute(json!({"action":"oops"})).await;
+        assert!(result.is_err());
+    }
+}

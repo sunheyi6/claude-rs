@@ -1,7 +1,7 @@
 use std::path::Path;
 use tokio::fs;
 
-const DEFAULT_LIMIT: usize = 32 * 1024; // 32 KiB
+const DEFAULT_LIMIT: usize = 4 * 1024; // 4 KiB, reduce prompt overhead for faster first-token latency
 
 /// Load AGENTS.md and AGENTS.override.md files by walking from the current
 /// directory up to the filesystem root.
@@ -47,7 +47,11 @@ pub async fn load_agents_md(cwd: &Path, limit: Option<usize>) -> anyhow::Result<
         combined.push_str(&format!("<!-- From: {} -->\n", path.display()));
         combined.push_str(&text);
         if combined.len() > limit {
-            combined.truncate(limit);
+            let mut safe = limit.min(combined.len());
+            while safe > 0 && !combined.is_char_boundary(safe) {
+                safe -= 1;
+            }
+            combined.truncate(safe);
             combined.push_str("\n\n[truncated]");
             break;
         }
@@ -79,5 +83,23 @@ mod tests {
         assert!(result.contains("Root agents"));
         assert!(result.contains("Sub agents"));
         assert!(result.contains("<!-- From:"));
+    }
+
+    #[tokio::test]
+    async fn test_load_agents_md_boundary_limit_truncates() {
+        let tmp = TempDir::new().expect("create temp dir");
+        let root = tmp.path();
+        let mut f = std::fs::File::create(root.join("AGENTS.md")).expect("create file");
+        writeln!(f, "{}", "x".repeat(256)).expect("write content");
+
+        let result = load_agents_md(root, Some(32)).await.expect("load should succeed");
+        assert!(result.contains("[truncated]"));
+    }
+
+    #[tokio::test]
+    async fn test_load_agents_md_error_nonexistent_dir() {
+        let missing = Path::new("Z:/path/that/does/not/exist");
+        let result = load_agents_md(missing, None).await;
+        assert!(result.is_ok());
     }
 }

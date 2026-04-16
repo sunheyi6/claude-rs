@@ -13,6 +13,7 @@ use claude_rs_tools::{
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio_stream::StreamExt;
 use tracing::{debug, info};
 
 const MAX_MESSAGES_BEFORE_COMPACT: usize = 20;
@@ -115,6 +116,18 @@ impl Agent {
         &self.options.model
     }
 
+    pub fn set_fast_mode(&mut self, enabled: bool) {
+        if enabled {
+            self.options.max_tokens = Some(1024);
+            self.options
+                .extra
+                .insert("thinking".to_string(), json!({ "type": "disabled" }));
+        } else {
+            self.options.max_tokens = None;
+            self.options.extra.remove("thinking");
+        }
+    }
+
     pub fn compact_now(&mut self) -> usize {
         let before = self.messages.len();
         compaction::compact_messages(&mut self.messages, KEEP_RECENT_MESSAGES);
@@ -163,7 +176,68 @@ impl Agent {
 
     pub async fn run_turn(&mut self, user_input: impl Into<String>) -> anyhow::Result<String> {
         self.messages.push(Message::user(user_input));
+        self.run_turn_from_current().await
+    }
 
+    pub async fn run_turn_stream<F>(
+        &mut self,
+        user_input: impl Into<String>,
+        mut on_text: F,
+    ) -> anyhow::Result<String>
+    where
+        F: FnMut(&str),
+    {
+        self.messages.push(Message::user(user_input));
+
+        if self.messages.len() > MAX_MESSAGES_BEFORE_COMPACT {
+            compaction::compact_messages(&mut self.messages, KEEP_RECENT_MESSAGES);
+            info!("compacted conversation to {} messages", self.messages.len());
+        }
+
+        let tool_defs: Vec<ToolDefinition> = self.tools.iter().map(|t| definition(t.as_ref())).collect();
+        info!(
+            "streaming llm call with {} messages (~{} est. tokens)",
+            self.messages.len(),
+            compaction::total_tokens(&self.messages)
+        );
+
+        let mut stream = self
+            .provider
+            .chat_stream(&self.messages, &tool_defs, &self.options)
+            .await?;
+
+        let mut text = String::new();
+        let mut stop_reason = StopReason::End;
+        while let Some(chunk) = stream.next().await {
+            match chunk? {
+                claude_rs_llm::StreamChunk::Text(delta) => {
+                    if !delta.is_empty() {
+                        on_text(&delta);
+                        text.push_str(&delta);
+                    }
+                }
+                claude_rs_llm::StreamChunk::Stop(reason) => {
+                    stop_reason = reason;
+                }
+                claude_rs_llm::StreamChunk::ToolCallDelta { .. } => {}
+            }
+        }
+
+        match stop_reason {
+            StopReason::End => {
+                self.messages.push(Message::assistant(text.clone()));
+                Ok(text)
+            }
+            StopReason::Length => Ok("[Response was truncated due to length limit]".to_string()),
+            StopReason::Other(reason) => Ok(format!("[Stopped: {}]", reason)),
+            StopReason::ToolUse(_) => {
+                // Fallback to full non-stream turn for tool execution loop.
+                self.run_turn_from_current().await
+            }
+        }
+    }
+
+    async fn run_turn_from_current(&mut self) -> anyhow::Result<String> {
         if self.messages.len() > MAX_MESSAGES_BEFORE_COMPACT {
             compaction::compact_messages(&mut self.messages, KEEP_RECENT_MESSAGES);
             info!("compacted conversation to {} messages", self.messages.len());
@@ -190,13 +264,11 @@ impl Agent {
 
             match response.stop_reason {
                 StopReason::End => {
-                    self.messages
-                        .push(Message::assistant(response.text.clone()));
+                    self.messages.push(Message::assistant(response.text.clone()));
                     return Ok(response.text);
                 }
                 StopReason::ToolUse(calls) => {
-                    self.messages
-                        .push(Message::assistant(response.text.clone()));
+                    self.messages.push(Message::assistant(response.text.clone()));
 
                     for call in calls {
                         let result = self.execute_tool(&call).await;
@@ -279,5 +351,130 @@ impl Tool for TaskTool {
 
         let result = subagent.run_turn(description).await?;
         Ok(format!("Subagent completed task. Summary: {}", result))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use claude_rs_llm::{ChatResponse, StreamChunk, TokenUsage};
+    use std::collections::VecDeque;
+    use tokio::sync::Mutex;
+
+    struct MockProvider {
+        chat_queue: Mutex<VecDeque<anyhow::Result<ChatResponse>>>,
+        stream_queue: Mutex<VecDeque<anyhow::Result<Vec<anyhow::Result<StreamChunk>>>>>,
+    }
+
+    impl MockProvider {
+        fn new(chat_items: Vec<anyhow::Result<ChatResponse>>) -> Self {
+            Self {
+                chat_queue: Mutex::new(chat_items.into()),
+                stream_queue: Mutex::new(VecDeque::new()),
+            }
+        }
+
+        fn with_stream(mut self, items: Vec<anyhow::Result<Vec<anyhow::Result<StreamChunk>>>>) -> Self {
+            self.stream_queue = Mutex::new(items.into());
+            self
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for MockProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _options: &ChatOptions,
+        ) -> anyhow::Result<ChatResponse> {
+            self.chat_queue
+                .lock()
+                .await
+                .pop_front()
+                .unwrap_or_else(|| Err(anyhow::anyhow!("no chat response queued")))
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _options: &ChatOptions,
+        ) -> anyhow::Result<
+            Box<dyn tokio_stream::Stream<Item = anyhow::Result<StreamChunk>> + Send + Unpin>,
+        > {
+            let chunks = self
+                .stream_queue
+                .lock()
+                .await
+                .pop_front()
+                .unwrap_or_else(|| Ok(vec![Ok(StreamChunk::Stop(StopReason::End))]))?;
+            Ok(Box::new(tokio_stream::iter(chunks)))
+        }
+    }
+
+    fn end_response(text: &str) -> anyhow::Result<ChatResponse> {
+        Ok(ChatResponse {
+            text: text.to_string(),
+            tool_calls: Vec::new(),
+            stop_reason: StopReason::End,
+            usage: Some(TokenUsage::default()),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_agent_run_turn_normal_returns_assistant_text() {
+        let provider = Arc::new(MockProvider::new(vec![end_response("ok")]));
+        let mut agent = Agent::new(provider, ChatOptions::new("test-model"));
+        agent.set_system_prompt("sys");
+
+        let output = agent.run_turn("hello").await.expect("turn should succeed");
+        assert_eq!(output, "ok");
+    }
+
+    #[tokio::test]
+    async fn test_agent_run_turn_stream_boundary_collects_chunks() {
+        let provider = Arc::new(
+            MockProvider::new(vec![]).with_stream(vec![Ok(vec![
+                Ok(StreamChunk::Text("A".to_string())),
+                Ok(StreamChunk::Text("B".to_string())),
+                Ok(StreamChunk::Stop(StopReason::End)),
+            ])]),
+        );
+        let mut agent = Agent::new(provider, ChatOptions::new("test-model"));
+
+        let mut seen = String::new();
+        let output = agent
+            .run_turn_stream("hello", |chunk| seen.push_str(chunk))
+            .await
+            .expect("stream turn should succeed");
+        assert_eq!(output, "AB");
+        assert_eq!(seen, "AB");
+    }
+
+    #[tokio::test]
+    async fn test_agent_run_turn_error_provider_failure() {
+        let provider = Arc::new(MockProvider::new(vec![Err(anyhow::anyhow!("boom"))]));
+        let mut agent = Agent::new(provider, ChatOptions::new("test-model"));
+        let result = agent.run_turn("hello").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_agent_fast_mode_normal_enable_and_disable() {
+        let provider = Arc::new(MockProvider::new(vec![end_response("ok")]));
+        let mut agent = Agent::new(provider, ChatOptions::new("test-model"));
+        agent.set_fast_mode(true);
+        assert!(agent.status_summary().contains("model: test-model"));
+        agent.set_fast_mode(false);
+        assert!(agent.status_summary().contains("permission_mode"));
+    }
+
+    #[tokio::test]
+    async fn test_agent_status_summary_boundary_contains_workspace_root() {
+        let provider = Arc::new(MockProvider::new(vec![end_response("ok")]));
+        let agent = Agent::new(provider, ChatOptions::new("test-model"));
+        let summary = agent.status_summary();
+        assert!(summary.contains("workspace_root:"));
     }
 }

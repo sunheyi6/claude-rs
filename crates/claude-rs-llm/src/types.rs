@@ -147,3 +147,46 @@ impl ChatOptions {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_message_builders_normal_construct_variants() {
+        assert!(matches!(Message::system("s"), Message::System { .. }));
+        assert!(matches!(Message::user("u"), Message::User { .. }));
+        assert!(matches!(Message::assistant("a"), Message::Assistant { .. }));
+        assert!(matches!(Message::tool("id", "t"), Message::Tool { .. }));
+    }
+
+    #[test]
+    fn test_tool_definition_boundary_empty_description_allowed() {
+        let def = ToolDefinition::new("name", "", serde_json::json!({"type":"object"}));
+        assert_eq!(def.name, "name");
+        assert_eq!(def.description, "");
+    }
+
+    #[test]
+    fn test_chat_options_normal_defaults_are_none() {
+        let opts = ChatOptions::new("model");
+        assert_eq!(opts.model, "model");
+        assert_eq!(opts.temperature, None);
+        assert_eq!(opts.max_tokens, None);
+        assert_eq!(opts.top_p, None);
+    }
+
+    #[test]
+    fn test_chat_options_boundary_extra_accepts_custom_values() {
+        let mut opts = ChatOptions::new("model");
+        opts.extra.insert("thinking".to_string(), serde_json::json!({"type":"disabled"}));
+        assert!(opts.extra.contains_key("thinking"));
+    }
+
+    #[test]
+    fn test_tool_call_error_case_invalid_json_arguments_deserialize_failure() {
+        let raw = r#"{"name":"read","arguments":{}}"#;
+        let parsed: Result<ToolCall, _> = serde_json::from_str(raw);
+        assert!(parsed.is_err());
+    }
+}
