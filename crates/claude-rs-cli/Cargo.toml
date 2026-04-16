@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "crs"
 path = "src/main.rs"
 
+[lib]
+name = "claude_rs_cli"
+path = "src/lib.rs"
+
 [dependencies]
 claude-rs-core = { path = "../claude-rs-core" }
 claude-rs-llm = { path = "../claude-rs-llm" }

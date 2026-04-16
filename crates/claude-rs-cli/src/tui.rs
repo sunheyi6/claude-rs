@@ -1,5 +1,8 @@
-use claude_rs_core::Agent;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use claude_rs_core::session;
+use claude_rs_core::{Agent, PermissionMode};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use crossterm::style::{Color as CrosstermColor, Print, ResetColor, SetForegroundColor};
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::{cursor, execute};
@@ -11,7 +14,6 @@ use claude_rs_llm::{openai::OpenAiProvider, ChatOptions};
 use std::path::PathBuf;
 
 const ACCENT: CrosstermColor = CrosstermColor::Rgb { r: 255, g: 107, b: 107 };
-const DIM: CrosstermColor = CrosstermColor::Rgb { r: 120, g: 120, b: 120 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -56,6 +58,7 @@ enum Sender {
 
 enum AppEvent {
     Key(KeyEvent),
+    Mouse(MouseEvent),
     Paste(String),
     AgentResponse(Result<String, String>),
 }
@@ -74,6 +77,8 @@ struct App {
     mode: Mode,
     waiting: bool,
     welcome_shown: bool,
+    command_suggestions: Vec<&'static str>,
+    command_selected: usize,
 }
 
 impl App {
@@ -86,6 +91,31 @@ impl App {
             mode,
             waiting: false,
             welcome_shown: false,
+            command_suggestions: Vec::new(),
+            command_selected: 0,
+        }
+    }
+
+    fn refresh_command_suggestions(&mut self) {
+        let query = command_query(&self.input);
+        self.command_suggestions = query
+            .map(filter_commands)
+            .unwrap_or_default()
+            .into_iter()
+            .take(6)
+            .collect();
+        if self.command_suggestions.is_empty() {
+            self.command_selected = 0;
+        } else if self.command_selected >= self.command_suggestions.len() {
+            self.command_selected = self.command_suggestions.len() - 1;
+        }
+    }
+
+    fn selected_command_for_enter(&self) -> Option<String> {
+        if self.command_suggestions.is_empty() {
+            None
+        } else {
+            Some(self.command_suggestions[self.command_selected].to_string())
         }
     }
 }
@@ -94,13 +124,95 @@ fn display_width(s: &str) -> usize {
     s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
 }
 
+fn is_exit_input(input: &str) -> bool {
+    input.trim() == "quit"
+}
+
+const COMMAND_LIST: [&str; 14] = [
+    "/status",
+    "/clear",
+    "/compact",
+    "/save",
+    "/history",
+    "/quit",
+    "/exit",
+    "/permissions read-only",
+    "/permissions workspace-write",
+    "/permissions danger-full-access",
+    "/model kimi-for-coding",
+    "/fast on",
+    "/fast off",
+    "/resume <会话ID>",
+];
+
+fn command_query(input: &str) -> Option<&str> {
+    let trimmed = input.trim_start();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+    Some(trimmed.trim_start_matches('/'))
+}
+
+fn fuzzy_match(command: &str, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let mut chars = query.chars().map(|c| c.to_ascii_lowercase());
+    let mut next = chars.next();
+    for c in command.chars().map(|c| c.to_ascii_lowercase()) {
+        if let Some(n) = next {
+            if c == n {
+                next = chars.next();
+            }
+        } else {
+            return true;
+        }
+    }
+    next.is_none()
+}
+
+fn filter_commands(query: &str) -> Vec<&'static str> {
+    let query = query.to_ascii_lowercase();
+    let mut items: Vec<&'static str> = COMMAND_LIST
+        .iter()
+        .copied()
+        .filter(|cmd| fuzzy_match(cmd, &query))
+        .collect();
+    items.sort_by_key(|cmd| cmd.len());
+    items
+}
+
+fn fuzzy_match_positions(command: &str, query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let mut positions = Vec::new();
+    let mut q = query.chars().map(|c| c.to_ascii_lowercase());
+    let mut next = q.next();
+    for (idx, c) in command.chars().enumerate() {
+        if let Some(n) = next {
+            if c.to_ascii_lowercase() == n {
+                positions.push(idx);
+                next = q.next();
+                if next.is_none() {
+                    break;
+                }
+            }
+        } else {
+            break;
+        }
+    }
+    if next.is_none() { positions } else { Vec::new() }
+}
+
 pub async fn run(config: TuiConfig) -> anyhow::Result<()> {
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(
         stdout,
         cursor::Show,
-        event::EnableBracketedPaste
+        event::EnableBracketedPaste,
+        event::EnableMouseCapture
     )?;
 
     let result = app_loop(&mut stdout, config).await;
@@ -110,7 +222,8 @@ pub async fn run(config: TuiConfig) -> anyhow::Result<()> {
     execute!(
         stdout,
         cursor::Show,
-        event::DisableBracketedPaste
+        event::DisableBracketedPaste,
+        event::DisableMouseCapture
     )?;
 
     result
@@ -122,6 +235,9 @@ fn terminal_height() -> u16 {
 
 fn clear_prompt(stdout: &mut io::Stdout) -> anyhow::Result<()> {
     let h = terminal_height();
+    for row in h.saturating_sub(7)..h.saturating_sub(1) {
+        execute!(stdout, cursor::MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+    }
     execute!(stdout, cursor::MoveTo(0, h - 1), Clear(ClearType::CurrentLine))?;
     Ok(())
 }
@@ -130,6 +246,41 @@ fn draw_prompt(stdout: &mut io::Stdout, app: &App) -> anyhow::Result<()> {
     clear_prompt(stdout)?;
     let h = terminal_height();
     let (w, _) = crossterm::terminal::size()?;
+    if !app.command_suggestions.is_empty() {
+        let count = app.command_suggestions.len() as u16;
+        let start_row = h.saturating_sub(1 + count);
+        let query = command_query(&app.input).unwrap_or("");
+        for (i, cmd) in app.command_suggestions.iter().enumerate() {
+            let row = start_row + i as u16;
+            execute!(stdout, cursor::MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+            let selected = i == app.command_selected;
+            let base = if selected {
+                CrosstermColor::Yellow
+            } else {
+                CrosstermColor::DarkGrey
+            };
+            execute!(
+                stdout,
+                cursor::MoveTo(0, row),
+                SetForegroundColor(base),
+                Print(if selected { "▶ " } else { "  " }),
+            )?;
+            let positions = fuzzy_match_positions(cmd, query);
+            if positions.is_empty() {
+                execute!(stdout, Print(*cmd), ResetColor)?;
+            } else {
+                for (idx, ch) in cmd.chars().enumerate() {
+                    if positions.contains(&idx) {
+                        execute!(stdout, SetForegroundColor(CrosstermColor::Cyan), Print(ch))?;
+                    } else {
+                        execute!(stdout, SetForegroundColor(base), Print(ch))?;
+                    }
+                }
+                execute!(stdout, ResetColor)?;
+            }
+        }
+    }
+
     let prompt = if app.waiting { "⏳ " } else { "> " };
     let input_text = match app.screen {
         Screen::ApiKeyInput => app.api_key_input.as_str(),
@@ -352,6 +503,7 @@ async fn app_loop(
     }
 
     show_welcome(stdout, &mut app)?;
+    app.refresh_command_suggestions();
 
     let event_tx = tx.clone();
     tokio::spawn(async move {
@@ -359,6 +511,11 @@ async fn app_loop(
             match event::read() {
                 Ok(Event::Key(key)) => {
                     if event_tx.send(AppEvent::Key(key)).is_err() {
+                        break;
+                    }
+                }
+                Ok(Event::Mouse(mouse)) => {
+                    if event_tx.send(AppEvent::Mouse(mouse)).is_err() {
                         break;
                     }
                 }
@@ -383,9 +540,26 @@ async fn app_loop(
             AppEvent::Paste(text) => {
                 match app.screen {
                     Screen::ApiKeyInput => app.api_key_input.push_str(&text),
-                    _ => app.input.push_str(&text),
+                    _ => {
+                        app.input.push_str(&text);
+                        app.refresh_command_suggestions();
+                    }
                 }
                 draw_prompt(stdout, &app)?;
+            }
+            AppEvent::Mouse(mouse) => {
+                if app.command_suggestions.is_empty() {
+                    continue;
+                }
+                if matches!(mouse.kind, MouseEventKind::Moved | MouseEventKind::Down(_)) {
+                    let h = terminal_height();
+                    let count = app.command_suggestions.len() as u16;
+                    let start_row = h.saturating_sub(1 + count);
+                    if mouse.row >= start_row && mouse.row < start_row + count {
+                        app.command_selected = (mouse.row - start_row) as usize;
+                        draw_prompt(stdout, &app)?;
+                    }
+                }
             }
             AppEvent::Key(key) => {
                 if key.kind != KeyEventKind::Press {
@@ -467,12 +641,40 @@ async fn app_loop(
                             };
                             draw_prompt(stdout, &app)?;
                         }
+                        KeyCode::Up if !app.command_suggestions.is_empty() => {
+                            if app.command_selected == 0 {
+                                app.command_selected = app.command_suggestions.len() - 1;
+                            } else {
+                                app.command_selected -= 1;
+                            }
+                            draw_prompt(stdout, &app)?;
+                        }
+                        KeyCode::Down if !app.command_suggestions.is_empty() => {
+                            app.command_selected =
+                                (app.command_selected + 1) % app.command_suggestions.len();
+                            draw_prompt(stdout, &app)?;
+                        }
                         KeyCode::Enter if !app.waiting => {
-                            let text = app.input.trim().to_string();
+                            let mut text = app.input.trim().to_string();
                             if text.is_empty() {
                                 continue;
                             }
+                            if text.starts_with('/') && !app.command_suggestions.is_empty() {
+                                if let Some(selected) = app.selected_command_for_enter() {
+                                    text = selected;
+                                }
+                            }
+                            if is_exit_input(&text) || matches!(text.as_str(), "/quit" | "/exit")
+                            {
+                                println!("再见！");
+                                break;
+                            }
                             app.input.clear();
+                            app.refresh_command_suggestions();
+
+                            if handle_local_command(stdout, &text, &agent, &app).await? {
+                                continue;
+                            }
 
                             let has_agent = agent.lock().await.is_some();
                             if !has_agent {
@@ -508,10 +710,12 @@ async fn app_loop(
                         }
                         KeyCode::Char(c) => {
                             app.input.push(c);
+                            app.refresh_command_suggestions();
                             draw_prompt(stdout, &app)?;
                         }
                         KeyCode::Backspace => {
                             app.input.pop();
+                            app.refresh_command_suggestions();
                             draw_prompt(stdout, &app)?;
                         }
                         _ => {}
@@ -529,6 +733,128 @@ async fn app_loop(
     }
 
     Ok(())
+}
+
+async fn handle_local_command(
+    stdout: &mut io::Stdout,
+    text: &str,
+    agent: &Arc<Mutex<Option<Agent>>>,
+    app: &App,
+) -> anyhow::Result<bool> {
+    if text == "/clear" {
+        if let Some(a) = agent.lock().await.as_mut() {
+            a.clear_session();
+        }
+        print_message(stdout, app, Sender::System, "会话已清空。")?;
+        return Ok(true);
+    }
+    if text == "/status" {
+        let msg = if let Some(a) = agent.lock().await.as_ref() {
+            a.status_summary()
+        } else {
+            "代理尚未初始化。".to_string()
+        };
+        print_message(stdout, app, Sender::System, &msg)?;
+        return Ok(true);
+    }
+    if text == "/compact" {
+        let msg = if let Some(a) = agent.lock().await.as_mut() {
+            format!("会话已压缩，移除了 {} 条消息。", a.compact_now())
+        } else {
+            "代理尚未初始化。".to_string()
+        };
+        print_message(stdout, app, Sender::System, &msg)?;
+        return Ok(true);
+    }
+    if text == "/save" {
+        let msg = if let Some(a) = agent.lock().await.as_mut() {
+            match a.save_session().await {
+                Ok(id) => format!("会话已保存：{}", id),
+                Err(e) => format!("保存会话失败：{}", e),
+            }
+        } else {
+            "代理尚未初始化。".to_string()
+        };
+        print_message(stdout, app, Sender::System, &msg)?;
+        return Ok(true);
+    }
+    if text == "/history" {
+        let msg = match session::list_sessions().await {
+            Ok(sessions) if sessions.is_empty() => "没有保存的会话。".to_string(),
+            Ok(sessions) => sessions
+                .into_iter()
+                .map(|s| format!("{} - {} messages - {}", s.id, s.messages.len(), s.updated_at))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Err(e) => format!("列出会话失败：{}", e),
+        };
+        print_message(stdout, app, Sender::System, &msg)?;
+        return Ok(true);
+    }
+    if let Some(value) = text.strip_prefix("/permissions ") {
+        let value = value.trim();
+        let msg = match PermissionMode::parse(value) {
+            Some(mode) => {
+                if let Some(a) = agent.lock().await.as_mut() {
+                    a.set_permission_mode(mode);
+                    format!("权限模式已更新为：{}", mode)
+                } else {
+                    "代理尚未初始化。".to_string()
+                }
+            }
+            None => "无效模式，可选 read-only / workspace-write / danger-full-access".to_string(),
+        };
+        print_message(stdout, app, Sender::System, &msg)?;
+        return Ok(true);
+    }
+    if let Some(model) = text.strip_prefix("/model ") {
+        let model = model.trim();
+        let msg = if model.is_empty() {
+            "用法：/model <模型名>".to_string()
+        } else if let Some(a) = agent.lock().await.as_mut() {
+            a.set_model(model.to_string());
+            format!("模型已切换为：{}", a.model())
+        } else {
+            "代理尚未初始化。".to_string()
+        };
+        print_message(stdout, app, Sender::System, &msg)?;
+        return Ok(true);
+    }
+    if let Some(value) = text.strip_prefix("/fast ") {
+        let enabled = matches!(value.trim().to_ascii_lowercase().as_str(), "on" | "1" | "true");
+        let msg = if let Some(a) = agent.lock().await.as_mut() {
+            a.set_fast_mode(enabled);
+            if enabled {
+                "Fast mode 已开启（max_tokens=1024, thinking=disabled）。".to_string()
+            } else {
+                "Fast mode 已关闭。".to_string()
+            }
+        } else {
+            "代理尚未初始化。".to_string()
+        };
+        print_message(stdout, app, Sender::System, &msg)?;
+        return Ok(true);
+    }
+    if let Some(id) = text.strip_prefix("/resume ") {
+        let id = id.trim();
+        let msg = if id.is_empty() || id.contains('<') {
+            "用法：/resume <会话ID>".to_string()
+        } else if let Some(a) = agent.lock().await.as_mut() {
+            match a.load_session(id).await {
+                Ok(()) => format!("已恢复会话 {}。", id),
+                Err(e) => format!("恢复会话失败：{}", e),
+            }
+        } else {
+            "代理尚未初始化。".to_string()
+        };
+        print_message(stdout, app, Sender::System, &msg)?;
+        return Ok(true);
+    }
+    if text.starts_with('/') {
+        print_message(stdout, app, Sender::System, "未知命令。")?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -568,5 +894,60 @@ mod tests {
     fn test_terminal_height_error_case_not_applicable_returns_positive() {
         let h = terminal_height();
         assert!(h > 0);
+    }
+
+    #[test]
+    fn test_filter_commands_normal_status_query() {
+        let result = filter_commands("sta");
+        assert!(result.iter().any(|c| *c == "/status"));
+    }
+
+    #[test]
+    fn test_filter_commands_boundary_empty_query_returns_all() {
+        let result = filter_commands("");
+        assert_eq!(result.len(), COMMAND_LIST.len());
+    }
+
+    #[test]
+    fn test_filter_commands_error_case_no_match_returns_empty() {
+        let result = filter_commands("zzzz-no-match");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_fuzzy_match_positions_normal_marks_chars() {
+        let positions = fuzzy_match_positions("/status", "sts");
+        assert_eq!(positions, vec![1, 2, 6]);
+    }
+
+    #[test]
+    fn test_fuzzy_match_boundary_subsequence() {
+        assert!(fuzzy_match("/permissions workspace-write", "pw"));
+    }
+
+    #[test]
+    fn test_fuzzy_match_error_case_non_subsequence() {
+        assert!(!fuzzy_match("/status", "zx"));
+    }
+
+    #[test]
+    fn test_fuzzy_match_positions_error_case_non_subsequence_empty_positions() {
+        let positions = fuzzy_match_positions("/status", "zx");
+        assert!(positions.is_empty());
+    }
+
+    #[test]
+    fn test_is_exit_input_normal_quit_word() {
+        assert!(is_exit_input("quit"));
+    }
+
+    #[test]
+    fn test_is_exit_input_boundary_trimmed_quit_word() {
+        assert!(is_exit_input("  quit "));
+    }
+
+    #[test]
+    fn test_is_exit_input_error_case_uppercase_not_allowed() {
+        assert!(!is_exit_input("QUIT"));
     }
 }

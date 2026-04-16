@@ -1,19 +1,23 @@
 use anyhow::Result;
 use clap::Parser;
+use claude_rs_cli::inline_repl::{CompletionState, MAX_COMPLETION_ROWS};
 use claude_rs_core::session;
 use claude_rs_core::{Agent, PermissionMode};
 use claude_rs_llm::{ChatOptions, openai::OpenAiProvider};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use crossterm::terminal;
+use crossterm::cursor::{self, MoveTo};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
+use crossterm::execute;
+use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
+use crossterm::terminal::{self, Clear, ClearType};
 use serde::Deserialize;
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+
 use tracing::{error, info};
 
-mod tui;
+use claude_rs_cli::{inline_repl, tui};
 
 #[derive(Parser, Debug)]
 #[command(name = "claude-rs", about = "一个快速的 Rust 原生 AI 编程助手")]
@@ -59,6 +63,9 @@ struct Args {
 
     #[arg(long)]
     fast: bool,
+
+    #[arg(long)]
+    inline: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -122,7 +129,6 @@ async fn main() -> Result<()> {
     info!("启动 claude-rs，模型：{}", args.model);
 
     let use_tui = args.tui && !args.no_tui;
-    let use_stream_tui = args.tui_stream && !args.no_tui;
 
     if use_tui {
         let mode = if args.plan {
@@ -180,23 +186,20 @@ async fn main() -> Result<()> {
         }
     }
 
-    if use_stream_tui {
-        print_stream_tui_welcome(&args.model);
-        if args.no_alt_screen {
-            println!("Tip: 当前 TUI 为流式模式，默认使用 PowerShell 原生滚动条。\n");
-        }
-        if args.fast {
-            println!("Fast mode: ON（低延迟配置已启用）\n");
-        }
-    } else {
-        print_cli_welcome();
-        if args.fast {
-            println!("Fast mode: ON（低延迟配置已启用）\n");
-        }
+    // 默认交互模式：轻量级增强 REPL（有实时补全、底部输入框）
+    if !test_mode {
+        let agent = Arc::new(tokio::sync::Mutex::new(agent));
+        return inline_repl::run(agent).await;
+    }
+
+    // 以下仅为测试/管道 stdin 保留的兼容回退（line-buffered REPL）
+    print_cli_welcome();
+    if args.fast {
+        println!("Fast mode: ON（低延迟配置已启用）\n");
     }
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     std::thread::spawn(move || loop {
-        match read_input_line_with_fallback() {
+        match read_input_line_with_fallback(test_mode) {
             Ok(Some(v)) => {
                 if tx.send(v).is_err() {
                     break;
@@ -213,11 +216,7 @@ async fn main() -> Result<()> {
         let next = if let Some(v) = queued.pop_front() {
             v
         } else {
-            if use_stream_tui {
-                print!("✨ ");
-            } else {
-                print!("> ");
-            }
+            print!("> ");
             io::stdout().flush()?;
 
             match rx.recv().await {
@@ -235,12 +234,12 @@ async fn main() -> Result<()> {
         }
 
         let is_command = input.starts_with('/');
-        if !use_stream_tui && !is_command {
+        if !is_command {
             print_user_bar(&input);
         }
 
         match input.as_str() {
-            "/quit" | "/exit" => {
+            cmd if is_exit_command(cmd) => {
                 println!("再见！");
                 break;
             }
@@ -380,11 +379,17 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn read_input_line_with_fallback() -> anyhow::Result<Option<String>> {
+fn read_input_line_with_fallback(test_mode: bool) -> anyhow::Result<Option<String>> {
     let mut input = String::new();
     match io::stdin().read_line(&mut input) {
         Ok(0) => Ok(None),
-        Ok(_) => Ok(Some(input)),
+        Ok(_) => {
+            let line = input.trim_end_matches(['\r', '\n']).to_string();
+            if !line.starts_with('/') || test_mode {
+                return Ok(Some(line));
+            }
+            pick_command_for_standard_mode(&line)
+        }
         Err(e) => {
             #[cfg(target_os = "windows")]
             {
@@ -392,7 +397,10 @@ fn read_input_line_with_fallback() -> anyhow::Result<Option<String>> {
                 // Always fallback to key-event reading for robust interactive input.
                 let _ = e;
                 let line = read_line_from_key_events()?;
-                return Ok(Some(line));
+                if !line.starts_with('/') || test_mode {
+                    return Ok(Some(line));
+                }
+                return pick_command_for_standard_mode(&line);
             }
             #[cfg(not(target_os = "windows"))]
             {
@@ -430,6 +438,159 @@ fn read_line_from_key_events() -> anyhow::Result<String> {
             _ => {}
         }
     }
+}
+
+fn pick_command_for_standard_mode(initial: &str) -> anyhow::Result<Option<String>> {
+    if !initial.starts_with('/') {
+        return Ok(Some(initial.to_string()));
+    }
+
+    let mut query = initial.to_string();
+    let mut completion = CompletionState::new();
+    completion.refresh(&query);
+
+    terminal::enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, event::EnableMouseCapture)?;
+    let (_, base_row) = cursor::position().unwrap_or((0, 0));
+
+    loop {
+        draw_command_picker(&mut stdout, base_row, &query, &completion)?;
+        match event::read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Esc => {
+                    execute!(
+                        stdout,
+                        MoveTo(0, base_row),
+                        Clear(ClearType::FromCursorDown),
+                        event::DisableMouseCapture
+                    )?;
+                    terminal::disable_raw_mode()?;
+                    println!();
+                    return Ok(Some(String::new()));
+                }
+                KeyCode::Enter => {
+                    let selected = if completion.active {
+                        completion
+                            .accept()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| query.trim().to_string())
+                    } else {
+                        query.trim().to_string()
+                    };
+                    execute!(
+                        stdout,
+                        MoveTo(0, base_row),
+                        Clear(ClearType::FromCursorDown),
+                        event::DisableMouseCapture
+                    )?;
+                    terminal::disable_raw_mode()?;
+                    println!();
+                    return Ok(Some(selected));
+                }
+                KeyCode::Up => {
+                    completion.prev();
+                }
+                KeyCode::Down => {
+                    completion.next();
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                    completion.refresh(&query);
+                }
+                KeyCode::Char(c) => {
+                    query.push(c);
+                    completion.refresh(&query);
+                }
+                _ => {}
+            },
+            Event::Mouse(mouse) => {
+                if !completion.active {
+                    continue;
+                }
+                let list_start = base_row.saturating_add(2);
+                let list_len = completion.filtered.len().min(MAX_COMPLETION_ROWS) as u16;
+                let in_list = mouse.row >= list_start && mouse.row < list_start + list_len;
+                match mouse.kind {
+                    MouseEventKind::Moved if in_list => {
+                        completion.select_by_mouse(mouse.row, list_start);
+                    }
+                    MouseEventKind::Down(MouseButton::Left) if in_list => {
+                        completion.select_by_mouse(mouse.row, list_start);
+                        let selected = completion
+                            .accept()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| query.trim().to_string());
+                        execute!(
+                            stdout,
+                            MoveTo(0, base_row),
+                            Clear(ClearType::FromCursorDown),
+                            event::DisableMouseCapture
+                        )?;
+                        terminal::disable_raw_mode()?;
+                        println!();
+                        return Ok(Some(selected));
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn draw_command_picker(
+    stdout: &mut io::Stdout,
+    base_row: u16,
+    query: &str,
+    completion: &CompletionState,
+) -> anyhow::Result<()> {
+    execute!(stdout, MoveTo(0, base_row), Clear(ClearType::FromCursorDown))?;
+    execute!(
+        stdout,
+        SetForegroundColor(Color::DarkGrey),
+        Print("命令输入（↑↓/鼠标/Enter，Esc取消）\n"),
+        ResetColor,
+        Print(format!("> {}\n", query))
+    )?;
+
+    if completion.active {
+        for (i, cmd) in completion
+            .filtered
+            .iter()
+            .take(MAX_COMPLETION_ROWS)
+            .enumerate()
+        {
+            let selected = i == completion.selected;
+            execute!(
+                stdout,
+                SetForegroundColor(if selected { Color::Cyan } else { Color::DarkGrey }),
+                Print(if selected { "▶ " } else { "  " }),
+                ResetColor,
+                SetForegroundColor(Color::White),
+                Print(cmd.name),
+                ResetColor,
+                Print(" "),
+                SetForegroundColor(Color::Grey),
+                Print(cmd.desc),
+                ResetColor,
+                Print("\n")
+            )?;
+        }
+    } else {
+        execute!(
+            stdout,
+            SetForegroundColor(Color::DarkGrey),
+            Print("无匹配命令，Enter 将按原输入执行。\n"),
+            ResetColor
+        )?;
+    }
+    stdout.flush()?;
+    Ok(())
+}
+
+fn is_exit_command(input: &str) -> bool {
+    matches!(input.trim(), "/quit" | "/exit" | "quit")
 }
 
 fn print_cli_welcome() {
@@ -485,34 +646,6 @@ fn print_cli_welcome() {
     }
 
     println!("{ORANGE}└{}┘{RESET}", "─".repeat(inner));
-    println!();
-}
-
-fn print_stream_tui_welcome(model: &str) {
-    let cwd = std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .display()
-        .to_string();
-    let session = format!(
-        "{:x}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0)
-    );
-
-    const BLUE: &str = "\x1b[94m";
-    const DIM: &str = "\x1b[90m";
-    const RESET: &str = "\x1b[0m";
-
-    println!("{BLUE}┌──────────────────────────────────────────────────────────────────────────────┐{RESET}");
-    println!("{BLUE}│{RESET}  欢迎使用 claude-rs TUI！                                                   {BLUE}│{RESET}");
-    println!("{BLUE}│{RESET}  可用命令：/status /permissions /model /compact /quit                  {BLUE}│{RESET}");
-    println!("{BLUE}│{RESET}                                                                              {BLUE}│{RESET}");
-    println!("{BLUE}│{RESET}  {DIM}目录：{RESET} {cwd}");
-    println!("{BLUE}│{RESET}  {DIM}会话：{RESET} {session}");
-    println!("{BLUE}│{RESET}  {DIM}模型：{RESET} {model}");
-    println!("{BLUE}└──────────────────────────────────────────────────────────────────────────────┘{RESET}");
     println!();
 }
 
@@ -641,5 +774,20 @@ mod tests {
     #[test]
     fn test_print_queued_preview_boundary_empty_text_no_panic() {
         print_queued_preview("", 0);
+    }
+
+    #[test]
+    fn test_is_exit_command_normal_quit_word() {
+        assert!(is_exit_command("quit"));
+    }
+
+    #[test]
+    fn test_is_exit_command_boundary_trimmed_quit_word() {
+        assert!(is_exit_command("  quit  "));
+    }
+
+    #[test]
+    fn test_is_exit_command_error_case_uppercase_not_allowed() {
+        assert!(!is_exit_command("QUIT"));
     }
 }
